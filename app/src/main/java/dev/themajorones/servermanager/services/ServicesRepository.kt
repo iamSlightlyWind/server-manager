@@ -18,7 +18,7 @@ class ServicesRepository(
     suspend fun listServices(machine: MachineEntity): List<ServiceItem> = withContext(Dispatchers.IO) {
         val output = commandExecutor.execute(
             machine,
-            "systemctl list-units --type=service --all --no-pager --no-legend --plain",
+            "systemctl list-units --type=service --all --no-pager --no-legend --plain --no-ask-password",
         )
         output.lines()
             .mapNotNull { line ->

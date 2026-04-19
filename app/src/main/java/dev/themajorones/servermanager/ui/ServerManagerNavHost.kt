@@ -2,6 +2,7 @@ package dev.themajorones.servermanager.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -16,18 +17,24 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -46,6 +53,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavType
@@ -54,6 +62,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import dev.themajorones.servermanager.AppContainer
+import dev.themajorones.servermanager.config.AppConstants
 import dev.themajorones.servermanager.data.AuthMode
 import dev.themajorones.servermanager.data.MachineDraft
 import dev.themajorones.servermanager.data.MachineEntity
@@ -63,12 +72,18 @@ import dev.themajorones.servermanager.metrics.GpuMetric
 import dev.themajorones.servermanager.metrics.NetworkMetric
 import dev.themajorones.servermanager.metrics.RamMetrics
 import dev.themajorones.servermanager.metrics.StorageMetric
+import dev.themajorones.servermanager.metrics.StorageItemMetric
 import dev.themajorones.servermanager.metrics.unavailable
 import dev.themajorones.servermanager.services.ServiceItem
+import dev.themajorones.servermanager.ui.charts.DonutUsageChart
+import dev.themajorones.servermanager.ui.charts.SparklineChart
+import java.util.Locale
 import kotlin.math.max
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 @Composable
 fun ServerManagerNavHost(container: AppContainer) {
@@ -140,28 +155,35 @@ private fun MachineListScreen(
                     val reachable = container.sshSessionManager.isReachable(machine)
                     container.machineRepository.updateReachability(machine.id, reachable)
                     if (reachable) {
-                        val hostname = runCatching { container.sshSessionManager.execute(machine, "hostname") }.getOrNull()
-                        val os = runCatching {
+                        val discovery = runCatching {
                             container.sshSessionManager.execute(
                                 machine,
-                                "cat /etc/os-release | awk -F= '/^PRETTY_NAME=/{gsub(/\"/,\"\",\$2);print \$2}'",
+                                "echo HOSTNAME=\$(hostname); echo OS=\$(cat /etc/os-release | awk -F= '/^PRETTY_NAME=/{gsub(/\"/,\"\",\$2);print \$2}' | head -n 1); echo UPTIME=\$(cut -d. -f1 /proc/uptime)",
                             )
                         }.getOrNull()
-                        val uptime = runCatching {
-                            container.sshSessionManager.execute(machine, "cut -d. -f1 /proc/uptime").toLongOrNull()
-                        }.getOrNull()
+                        val values = discovery
+                            ?.lines()
+                            ?.mapNotNull { line ->
+                                val separator = line.indexOf('=')
+                                if (separator <= 0) null else line.substring(0, separator).trim() to line.substring(separator + 1).trim()
+                            }
+                            ?.toMap()
+                            .orEmpty()
+                        val hostname = values["HOSTNAME"]
+                        val os = values["OS"]
+                        val uptime = values["UPTIME"]?.toLongOrNull()
                         container.machineRepository.updateDiscovery(machine.id, hostname, os, uptime)
                     }
                 }
             }
-            delay(5_000)
+            delay(AppConstants.Refresh.MACHINE_LIST_INTERVAL_MS)
         }
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Machine List") },
+                title = { Text("Server Fleet", style = MaterialTheme.typography.titleLarge) },
                 actions = {
                     IconButton(onClick = onCreate) {
                         Icon(Icons.Default.Add, contentDescription = "Add machine")
@@ -192,17 +214,44 @@ private fun MachineListScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 items(machines, key = { it.id }) { machine ->
-                    Card(modifier = Modifier.fillMaxWidth()) {
+                    val online = machine.isReachable
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (online) {
+                                MaterialTheme.colorScheme.surfaceContainerHigh
+                            } else {
+                                MaterialTheme.colorScheme.surfaceContainer
+                            },
+                        ),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp),
+                    ) {
                         Column(modifier = Modifier.padding(16.dp)) {
-                            Text(machine.discoveredHostname ?: machine.host, style = MaterialTheme.typography.titleMedium)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(machine.discoveredHostname ?: machine.host, style = MaterialTheme.typography.titleMedium)
+                                AssistChip(
+                                    onClick = {},
+                                    label = { Text(if (online) "Online" else "Offline") },
+                                    colors = AssistChipDefaults.assistChipColors(
+                                        containerColor = if (online) {
+                                            MaterialTheme.colorScheme.secondaryContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.errorContainer
+                                        },
+                                    ),
+                                )
+                            }
                             Spacer(modifier = Modifier.height(4.dp))
-                            Text(machine.discoveredOs ?: machine.osName ?: "OS unknown")
-                            Text(formatUptime(machine.uptimeSeconds))
-                            Text(if (machine.isReachable) "Online" else "Offline")
+                            Text(machine.discoveredOs ?: machine.osName ?: "OS unknown", style = MaterialTheme.typography.bodyMedium)
+                            Text(formatUptime(machine.uptimeSeconds), style = MaterialTheme.typography.bodyMedium)
                             Spacer(modifier = Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                TextButton(onClick = { onOpenDetail(machine.id) }) { Text("Details") }
-                                TextButton(onClick = { onOpenSettings(machine.id) }) { Text("Settings") }
+                                FilledTonalButton(onClick = { onOpenDetail(machine.id) }) { Text("Dashboard") }
+                                TextButton(onClick = { onOpenSettings(machine.id) }) { Text("Configure") }
                             }
                         }
                     }
@@ -243,7 +292,7 @@ private fun MachineSettingsScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text(if (machineId == 0L) "Add Machine" else "Machine Settings") })
+            TopAppBar(title = { Text(if (machineId == 0L) "Add Machine" else "Edit Machine", style = MaterialTheme.typography.titleLarge) })
         },
         snackbarHost = { SnackbarHost(hostState = snackbarHost) },
     ) { padding ->
@@ -254,6 +303,9 @@ private fun MachineSettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            item {
+                Text("Connection", style = MaterialTheme.typography.titleMedium)
+            }
             item {
                 OutlinedTextField(
                     value = host,
@@ -287,6 +339,9 @@ private fun MachineSettingsScreen(
                 )
             }
             item {
+                Text("Authentication", style = MaterialTheme.typography.titleMedium)
+            }
+            item {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = { authMode = AuthMode.PASSWORD },
@@ -317,7 +372,7 @@ private fun MachineSettingsScreen(
                 }
             }
             item {
-                Text("Parent Machines", style = MaterialTheme.typography.titleMedium)
+                Text("Routing Parents", style = MaterialTheme.typography.titleMedium)
             }
             items(allMachines.filter { it.id != machineId }, key = { it.id }) { candidate ->
                 val checked = selectedParents.contains(candidate.id)
@@ -370,7 +425,7 @@ private fun MachineSettingsScreen(
                     },
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text("Save")
+                    Text("Save Machine")
                 }
             }
         }
@@ -397,6 +452,11 @@ private fun MachineDetailScreen(
     var gpuLoading by remember { mutableStateOf(true) }
     var networkLoading by remember { mutableStateOf(true) }
     var storageLoading by remember { mutableStateOf(true) }
+    val cpuHistory = remember { mutableStateListOf<Float>() }
+    val ramHistory = remember { mutableStateListOf<Float>() }
+    val networkDownHistory = remember { mutableStateListOf<Float>() }
+    val networkUpHistory = remember { mutableStateListOf<Float>() }
+    val storageHistory = remember { mutableStateListOf<Float>() }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(machine?.id, machine?.storageScopeMode) {
@@ -412,6 +472,11 @@ private fun MachineDetailScreen(
         gpuLoading = true
         networkLoading = true
         storageLoading = true
+        cpuHistory.clear()
+        ramHistory.clear()
+        networkDownHistory.clear()
+        networkUpHistory.clear()
+        storageHistory.clear()
         refreshError = null
 
         while (true) {
@@ -443,7 +508,7 @@ private fun MachineDetailScreen(
 
             if (route == null) {
                 val elapsed = System.currentTimeMillis() - cycleStartedAt
-                delay(max(0L, 5_000L - elapsed))
+                delay(max(0L, AppConstants.Refresh.MACHINE_DETAIL_INTERVAL_MS - elapsed))
                 continue
             }
 
@@ -456,6 +521,7 @@ private fun MachineDetailScreen(
             } catch (error: Exception) {
                 unavailableCpuUi(error.message ?: "cpu collection failed")
             }
+            parsePercentValue(cpu?.usage?.value)?.let { appendHistory(cpuHistory, it) }
             cpuLoading = false
 
             ram = try {
@@ -465,6 +531,7 @@ private fun MachineDetailScreen(
             } catch (error: Exception) {
                 unavailableRamUi(error.message ?: "ram collection failed")
             }
+            parsePercentValue(ram?.usage?.value)?.let { appendHistory(ramHistory, it) }
             ramLoading = false
 
             gpus = try {
@@ -484,6 +551,13 @@ private fun MachineDetailScreen(
                 refreshError = "network: ${error.message ?: "collection failed"}"
                 emptyList()
             }
+            val primaryNetwork = networks?.firstOrNull()
+            parseThroughputMbps(primaryNetwork?.currentDown?.value)?.let {
+                appendHistory(networkDownHistory, it, maxPoints = AppConstants.Graph.HISTORY_MAX_POINTS)
+            }
+            parseThroughputMbps(primaryNetwork?.currentUp?.value)?.let {
+                appendHistory(networkUpHistory, it, maxPoints = AppConstants.Graph.HISTORY_MAX_POINTS)
+            }
             networkLoading = false
 
             storage = try {
@@ -497,10 +571,11 @@ private fun MachineDetailScreen(
                     total = unavailable(error.message ?: "storage collection failed"),
                 )
             }
+            parseStorageUsagePercent(storage)?.let { appendHistory(storageHistory, it) }
             storageLoading = false
 
             val elapsed = System.currentTimeMillis() - cycleStartedAt
-            delay(max(0L, 5_000L - elapsed))
+            delay(max(0L, AppConstants.Refresh.MACHINE_DETAIL_INTERVAL_MS - elapsed))
         }
     }
 
@@ -510,7 +585,7 @@ private fun MachineDetailScreen(
                 title = { Text(machine?.discoveredHostname ?: machine?.host ?: "Machine") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.Settings, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
@@ -533,8 +608,40 @@ private fun MachineDetailScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
+                SectionCard("Overview") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        AssistChip(
+                            onClick = {},
+                            label = { Text(if (current.isReachable) "Online" else "Offline") },
+                            colors = AssistChipDefaults.assistChipColors(
+                                containerColor = if (current.isReachable) {
+                                    MaterialTheme.colorScheme.secondaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.errorContainer
+                                },
+                            ),
+                        )
+                        AssistChip(
+                            onClick = {},
+                            label = { Text("Refresh ~${AppConstants.Refresh.MACHINE_DETAIL_INTERVAL_MS / 1_000}s") },
+                        )
+                        AssistChip(onClick = {}, label = { Text(current.storageScopeMode.name) })
+                    }
+                }
+            }
+
+            item {
                 refreshError?.let { error ->
-                    Text("Metrics error: $error")
+                    SectionCard("Connectivity Notice") {
+                        Text(
+                            text = error,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
                 }
             }
 
@@ -544,8 +651,23 @@ private fun MachineDetailScreen(
                 } else {
                     SectionCard("CPU") {
                         val cpuData = cpu ?: unavailableCpuUi("cpu unavailable")
+                        val cpuValue = parsePercentValue(cpuData.usage.value) ?: 0f
+                        Text(
+                            text = "${String.format(Locale.US, "%.1f", cpuValue)}% live load",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        SparklineChart(
+                            values = if (cpuHistory.isEmpty()) listOf(0f, 0f) else cpuHistory.toList(),
+                            color = MaterialTheme.colorScheme.primary,
+                            min = 0f,
+                            max = 100f,
+                            showStats = true,
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
                         FieldLine("Name", cpuData.name)
-                        FieldLine("Threads/Core", cpuData.threadsPerCore)
+                        FieldLine("Threads", cpuData.threads)
+                        FieldLine("Cores", cpuData.cores)
                         FieldLine("Clock", cpuData.clock)
                         FieldLine("Usage", cpuData.usage)
                         FieldLine("Temp", cpuData.temperature)
@@ -555,10 +677,52 @@ private fun MachineDetailScreen(
 
             item {
                 if (ramLoading && ram == null) {
-                    SkeletonSectionCard("RAM", lines = 2)
+                    SkeletonSectionCard("RAM", lines = 4)
                 } else {
                     SectionCard("RAM") {
                         val ramData = ram ?: unavailableRamUi("ram unavailable")
+                        val ramValue = parsePercentValue(ramData.usage.value) ?: 0f
+                        val zramValue = parsePercentValue(ramData.zram.value) ?: 0f
+                        val swapValue = parsePercentValue(ramData.swap.value) ?: 0f
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            RingMetricCard(
+                                title = "Memory",
+                                value = ramData.usage.value,
+                                percent = ramValue,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (ramData.zram.isAvailable) {
+                                RingMetricCard(
+                                    title = "ZRAM",
+                                    value = ramData.zram.value,
+                                    percent = zramValue,
+                                    color = MaterialTheme.colorScheme.tertiary,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                            if (ramData.swap.isAvailable) {
+                                RingMetricCard(
+                                    title = "Swap",
+                                    value = ramData.swap.value,
+                                    percent = swapValue,
+                                    color = MaterialTheme.colorScheme.secondary,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(10.dp))
+                        SparklineChart(
+                            values = if (ramHistory.isEmpty()) listOf(0f, 0f) else ramHistory.toList(),
+                            color = MaterialTheme.colorScheme.secondary,
+                            min = 0f,
+                            max = 100f,
+                            showStats = true,
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
                         FieldLine("Amount", ramData.amount)
                         FieldLine("Usage", ramData.usage)
                     }
@@ -590,6 +754,24 @@ private fun MachineDetailScreen(
                 } else {
                     SectionCard("Network") {
                         val networkData = networks ?: emptyList()
+                        Text("Download trend", style = MaterialTheme.typography.labelLarge)
+                        SparklineChart(
+                            values = if (networkDownHistory.isEmpty()) listOf(0f, 0f) else networkDownHistory.toList(),
+                            color = MaterialTheme.colorScheme.tertiary,
+                            min = 0f,
+                            max = maxThroughput(networkDownHistory, networkUpHistory),
+                            showStats = true,
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text("Upload trend", style = MaterialTheme.typography.labelLarge)
+                        SparklineChart(
+                            values = if (networkUpHistory.isEmpty()) listOf(0f, 0f) else networkUpHistory.toList(),
+                            color = MaterialTheme.colorScheme.primary,
+                            min = 0f,
+                            max = maxThroughput(networkDownHistory, networkUpHistory),
+                            showStats = true,
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
                         if (networkData.isEmpty()) {
                             FieldLine("Interfaces", unavailable("none detected"))
                         }
@@ -630,8 +812,49 @@ private fun MachineDetailScreen(
                                 used = unavailable("storage unavailable"),
                                 total = unavailable("storage unavailable"),
                             )
-                        FieldLine("Used", storageData.used)
-                        FieldLine("Total", storageData.total)
+                        if (storageData.items.isNotEmpty()) {
+                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                storageData.items.forEachIndexed { index, item ->
+                                    StorageRingCard(
+                                        item = item,
+                                        index = index,
+                                        totalCount = storageData.items.size,
+                                    )
+                                }
+                            }
+                        } else {
+                            val usagePercent = parseStorageUsagePercent(storageData) ?: 0f
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                DonutUsageChart(
+                                    usedPercent = usagePercent,
+                                    usedColor = MaterialTheme.colorScheme.secondary,
+                                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                                )
+                                Column {
+                                    Text(
+                                        text = "${String.format(Locale.US, "%.1f", usagePercent)}% used",
+                                        style = MaterialTheme.typography.titleMedium,
+                                    )
+                                    Text("Trend", style = MaterialTheme.typography.labelLarge)
+                                    SparklineChart(
+                                        values = if (storageHistory.isEmpty()) listOf(usagePercent, usagePercent) else storageHistory.toList(),
+                                        color = MaterialTheme.colorScheme.secondary,
+                                        min = 0f,
+                                        max = 100f,
+                                        modifier = Modifier.width(160.dp),
+                                        height = 56.dp,
+                                        showStats = false,
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            FieldLine("Used", storageData.used)
+                            FieldLine("Total", storageData.total)
+                        }
                     }
                 }
             }
@@ -648,32 +871,44 @@ private fun ServicesScreen(
 ) {
     val machine by container.machineRepository.observeMachine(machineId).collectAsStateCompat(null)
     var loading by remember { mutableStateOf(false) }
+    var loadedOnce by remember { mutableStateOf(false) }
     var services by remember { mutableStateOf<List<ServiceItem>>(emptyList()) }
     val scope = rememberCoroutineScope()
     val snackbarHost = remember { SnackbarHostState() }
+    val reloadMutex = remember { Mutex() }
 
     fun reload() {
         val current = machine ?: return
         scope.launch {
-            loading = true
-            services = runCatching { container.servicesRepository.listServices(current) }.getOrElse {
-                snackbarHost.showSnackbar("Failed to load services: ${it.message}")
-                emptyList()
+            reloadMutex.withLock {
+                loading = true
+                services = runCatching { container.servicesRepository.listServices(current) }.getOrElse {
+                    snackbarHost.showSnackbar("Failed to load services: ${it.message}")
+                    services
+                }
+                loadedOnce = true
+                loading = false
             }
-            loading = false
         }
     }
 
     LaunchedEffect(machine?.id) {
-        reload()
+        if (machine != null) {
+            while (true) {
+                reload()
+                delay(AppConstants.Refresh.MACHINE_DETAIL_INTERVAL_MS)
+            }
+        }
     }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Services") },
+                title = { Text("Service Control", style = MaterialTheme.typography.titleLarge) },
                 navigationIcon = {
-                    TextButton(onClick = onBack) { Text("Back") }
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
                 },
             )
         },
@@ -684,7 +919,7 @@ private fun ServicesScreen(
             BoxedMessage("Machine not found", Modifier.padding(padding))
             return@Scaffold
         }
-        if (loading) {
+        if (loading && !loadedOnce) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -697,46 +932,79 @@ private fun ServicesScreen(
             return@Scaffold
         }
 
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            items(services, key = { it.name }) { service ->
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text(service.name, fontWeight = FontWeight.Bold)
-                        Text("${service.loadState} / ${service.activeState} / ${service.subState}")
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            TextButton(onClick = {
-                                scope.launch {
-                                    runCatching { container.servicesRepository.start(current, service.name) }
-                                    reload()
-                                }
-                            }) { Text("Start") }
-                            TextButton(onClick = {
-                                scope.launch {
-                                    runCatching { container.servicesRepository.stop(current, service.name) }
-                                    reload()
-                                }
-                            }) { Text("Stop") }
-                            TextButton(onClick = {
-                                scope.launch {
-                                    runCatching { container.servicesRepository.enable(current, service.name) }
-                                    reload()
-                                }
-                            }) { Text("Enable") }
-                            TextButton(onClick = {
-                                scope.launch {
-                                    runCatching { container.servicesRepository.disable(current, service.name) }
-                                    reload()
-                                }
-                            }) { Text("Disable") }
+        Box(modifier = Modifier.fillMaxSize()) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(services, key = { it.name }) { service ->
+                    val active = service.activeState == "active"
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (active) {
+                                MaterialTheme.colorScheme.surfaceContainerHigh
+                            } else {
+                                MaterialTheme.colorScheme.surfaceContainer
+                            },
+                        ),
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(service.name, fontWeight = FontWeight.Bold)
+                                AssistChip(
+                                    onClick = {},
+                                    label = { Text(service.activeState.uppercase()) },
+                                    colors = AssistChipDefaults.assistChipColors(
+                                        containerColor = if (active) {
+                                            MaterialTheme.colorScheme.secondaryContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.surfaceVariant
+                                        },
+                                    ),
+                                )
+                            }
+                            Text("${service.loadState} / ${service.activeState} / ${service.subState}")
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                FilledTonalButton(onClick = {
+                                    scope.launch {
+                                        runCatching { container.servicesRepository.start(current, service.name) }
+                                        reload()
+                                    }
+                                }) { Text("Start") }
+                                FilledTonalButton(onClick = {
+                                    scope.launch {
+                                        runCatching { container.servicesRepository.stop(current, service.name) }
+                                        reload()
+                                    }
+                                }) { Text("Stop") }
+                                TextButton(onClick = {
+                                    scope.launch {
+                                        runCatching { container.servicesRepository.enable(current, service.name) }
+                                        reload()
+                                    }
+                                }) { Text("Enable") }
+                                TextButton(onClick = {
+                                    scope.launch {
+                                        runCatching { container.servicesRepository.disable(current, service.name) }
+                                        reload()
+                                    }
+                                }) { Text("Disable") }
+                            }
                         }
                     }
                 }
+            }
+
+            if (loading && loadedOnce) {
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.TopCenter).padding(top = 12.dp))
             }
         }
     }
@@ -754,7 +1022,7 @@ private fun StorageScopePicker(scopeMode: StorageScopeMode, onChange: (StorageSc
             label = { Text("Storage scope") },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
             modifier = Modifier
-                .menuAnchor()
+                .menuAnchor(type = MenuAnchorType.PrimaryNotEditable, enabled = true)
                 .fillMaxWidth(),
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
@@ -773,7 +1041,11 @@ private fun StorageScopePicker(scopeMode: StorageScopeMode, onChange: (StorageSc
 
 @Composable
 private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+    ) {
         Column(modifier = Modifier.padding(12.dp)) {
             Text(title, style = MaterialTheme.typography.titleMedium)
             Spacer(modifier = Modifier.height(8.dp))
@@ -808,7 +1080,14 @@ private fun SkeletonLine() {
 @Composable
 private fun FieldLine(label: String, field: dev.themajorones.servermanager.metrics.ResourceField) {
     val suffix = if (field.isAvailable) "" else " (${field.reason ?: "unavailable"})"
-    Text("$label: ${field.value}$suffix")
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("${field.value}$suffix", style = MaterialTheme.typography.bodyMedium)
+    }
 }
 
 @Composable
@@ -842,7 +1121,8 @@ private fun formatUptime(seconds: Long?): String {
 
 private fun unavailableCpuUi(reason: String): CpuMetrics = CpuMetrics(
     name = unavailable(reason),
-    threadsPerCore = unavailable(reason),
+    threads = unavailable(reason),
+    cores = unavailable(reason),
     clock = unavailable(reason),
     usage = unavailable(reason),
     temperature = unavailable(reason),
@@ -854,6 +1134,8 @@ private fun unavailableRamUi(reason: String): RamMetrics = RamMetrics(
     speed = unavailable(reason),
     clock = unavailable(reason),
     usage = unavailable(reason),
+    zram = unavailable(reason),
+    swap = unavailable(reason),
 )
 
 private fun unavailableGpuUi(reason: String): GpuMetric = GpuMetric(
@@ -868,4 +1150,126 @@ private fun unavailableGpuUi(reason: String): GpuMetric = GpuMetric(
 private fun hideMaxBandwidthForInterface(interfaceName: String): Boolean {
     val normalized = interfaceName.lowercase()
     return normalized.startsWith("tailscale") || normalized.startsWith("docker") || normalized.startsWith("br-")
+}
+
+private fun appendHistory(
+    history: MutableList<Float>,
+    value: Float,
+    maxPoints: Int = AppConstants.Graph.HISTORY_MAX_POINTS,
+) {
+    history += value
+    while (history.size > maxPoints) {
+        history.removeAt(0)
+    }
+}
+
+private fun parsePercentValue(text: String?): Float? {
+    if (text.isNullOrBlank()) return null
+    val candidate = text.substringBefore('%').trim()
+    return candidate.toFloatOrNull()
+}
+
+private fun parseThroughputMbps(text: String?): Float? {
+    if (text.isNullOrBlank()) return null
+    val value = text.substringBefore(' ').trim().toFloatOrNull() ?: return null
+    return when {
+        text.contains("Gbps", ignoreCase = true) -> value * 1000f
+        text.contains("Mbps", ignoreCase = true) -> value
+        text.contains("Kbps", ignoreCase = true) -> value / 1000f
+        text.contains("bps", ignoreCase = true) -> value / 1_000_000f
+        else -> null
+    }
+}
+
+private fun parseNumericValue(text: String?): Float? {
+    if (text.isNullOrBlank()) return null
+    val candidate = text.substringBefore(' ').replace("[^0-9.]".toRegex(), "")
+    return candidate.toFloatOrNull()
+}
+
+private fun parseStorageUsagePercent(storage: StorageMetric?): Float? {
+    val used = parseNumericValue(storage?.used?.value) ?: return null
+    val total = parseNumericValue(storage?.total?.value) ?: return null
+    if (total <= 0f) return null
+    return ((used / total) * 100f).coerceIn(0f, 100f)
+}
+
+private fun maxThroughput(down: List<Float>, up: List<Float>): Float {
+    val peak = (down + up).maxOrNull() ?: 1f
+    return if (peak < 10f) 10f else peak * 1.1f
+}
+
+@Composable
+private fun RingMetricCard(
+    title: String,
+    value: String,
+    percent: Float,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(title, style = MaterialTheme.typography.labelLarge)
+            Spacer(modifier = Modifier.height(8.dp))
+            DonutUsageChart(
+                usedPercent = percent,
+                usedColor = color,
+                trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                size = 72.dp,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(value, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
+private fun StorageRingCard(
+    item: StorageItemMetric,
+    index: Int,
+    totalCount: Int,
+) {
+    val percent = parsePercentValue(item.usage.value) ?: 0f
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            DonutUsageChart(
+                usedPercent = percent,
+                usedColor = when (index % 3) {
+                    0 -> MaterialTheme.colorScheme.primary
+                    1 -> MaterialTheme.colorScheme.secondary
+                    else -> MaterialTheme.colorScheme.tertiary
+                },
+                trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                size = 72.dp,
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(item.label, style = MaterialTheme.typography.titleMedium)
+                Text(item.usage.value, style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    text = "${item.used.value} / ${item.total.value}",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                if (totalCount > 1) {
+                    Text(
+                        text = "Item ${index + 1} of $totalCount",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
 }

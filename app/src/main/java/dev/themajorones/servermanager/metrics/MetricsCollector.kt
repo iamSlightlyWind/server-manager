@@ -1,5 +1,6 @@
 package dev.themajorones.servermanager.metrics
 
+import dev.themajorones.servermanager.config.AppConstants
 import dev.themajorones.servermanager.data.MachineEntity
 import dev.themajorones.servermanager.data.StorageScopeMode
 import dev.themajorones.servermanager.network.RouteKind
@@ -56,22 +57,27 @@ class MetricsCollector(
 
         val cpuBatch = command(
             machine,
-            "echo NAME=\$(awk -F: '/model name/{print \$2; exit}' /proc/cpuinfo | xargs); echo THREADS=\$(lscpu 2>/dev/null | awk -F: '/Thread\\(s\\) per core/{print \$2; exit}' | xargs); echo MHZ=\$(awk -F: '/cpu MHz/{print \$2; exit}' /proc/cpuinfo | xargs); echo USAGE=\$(top -bn1 | awk '/Cpu\\(s\\)/ {print \$2 + \$4}')",
+                "echo NAME=\$(awk -F: '/model name/{print \$2; exit}' /proc/cpuinfo | xargs); echo THREADS=\$(nproc 2>/dev/null || lscpu 2>/dev/null | awk -F: '/^CPU\\(s\\):/{print \$2; exit}' | xargs); echo CORES_PER_SOCKET=\$(lscpu 2>/dev/null | awk -F: '/^Core\\(s\\) per socket:/{print \$2; exit}' | xargs); echo SOCKETS=\$(lscpu 2>/dev/null | awk -F: '/^Socket\\(s\\):/{print \$2; exit}' | xargs); echo CORES_FALLBACK=\$(awk -F: '/^cpu cores/{print \$2; exit}' /proc/cpuinfo | xargs); echo MHZ=\$(awk -F: '/cpu MHz/{print \$2; exit}' /proc/cpuinfo | xargs); echo USAGE=\$(top -bn1 | awk '/Cpu\\(s\\)/ {print \$2 + \$4}')",
             "cpu batch",
-            timeoutSeconds = 7,
+            timeoutSeconds = AppConstants.Metrics.CPU_BATCH_TIMEOUT_SECONDS,
         )
         val tempRaw = command(
             machine,
             "for h in /sys/class/hwmon/hwmon*; do name=\$(cat \"\$h/name\" 2>/dev/null); case \"\$name\" in k10temp|coretemp|zenpower|cpu_thermal|fam15h_power) for t in \"\$h\"/temp*_input; do [ -r \"\$t\" ] || continue; v=\$(cat \"\$t\" 2>/dev/null); case \"\$v\" in ''|*[!0-9]*) continue;; esac; [ \"\$v\" -gt 0 ] && echo \"\$v\" && exit 0; done ;; esac; done; for z in /sys/class/thermal/thermal_zone*/temp; do [ -r \"\$z\" ] || continue; v=\$(cat \"\$z\" 2>/dev/null); case \"\$v\" in ''|*[!0-9]*) continue;; esac; [ \"\$v\" -gt 0 ] && echo \"\$v\" && exit 0; done; for h in /sys/class/hwmon/hwmon*; do for t in \"\$h\"/temp*_input; do [ -r \"\$t\" ] || continue; v=\$(cat \"\$t\" 2>/dev/null); case \"\$v\" in ''|*[!0-9]*) continue;; esac; [ \"\$v\" -gt 0 ] && echo \"\$v\" && exit 0; done; done",
             "cpu temp",
-            timeoutSeconds = 5,
+            timeoutSeconds = AppConstants.Metrics.CPU_TEMP_TIMEOUT_SECONDS,
         )
         val values = parseKeyValue(cpuBatch)
         val cpuTempRaw = if (tempRaw.isBlank()) "UNAVAILABLE:cpu temp:empty" else tempRaw
 
         return CpuMetrics(
             name = fieldValue(values, "NAME", "cpu name").toField(),
-            threadsPerCore = toIntegerField(fieldValue(values, "THREADS", "cpu threads/core"), "cpu threads/core"),
+                threads = toIntegerField(fieldValue(values, "THREADS", "cpu threads"), "cpu threads"),
+                cores = totalCoresField(
+                    coresPerSocketRaw = values["CORES_PER_SOCKET"],
+                    socketsRaw = values["SOCKETS"],
+                    fallbackRaw = values["CORES_FALLBACK"],
+                ),
             clock = mhzToGhzField(fieldValue(values, "MHZ", "cpu clock"), "cpu clock"),
             usage = percentField(fieldValue(values, "USAGE", "cpu usage"), "cpu usage"),
             temperature = normalizeTemperature(cpuTempRaw),
@@ -83,13 +89,21 @@ class MetricsCollector(
 
         val ramBatch = command(
             machine,
-            "echo TOTAL_KB=$(awk '/MemTotal/ {print \$2}' /proc/meminfo); echo AVAIL_KB=$(awk '/MemAvailable/ {print \$2}' /proc/meminfo)",
+            "echo TOTAL_KB=$(awk '/MemTotal/ {print \$2}' /proc/meminfo); echo AVAIL_KB=$(awk '/MemAvailable/ {print \$2}' /proc/meminfo); echo SWAP_TOTAL_KB=$(awk '/SwapTotal/ {print \$2}' /proc/meminfo); echo SWAP_FREE_KB=$(awk '/SwapFree/ {print \$2}' /proc/meminfo)",
             "ram batch",
-            timeoutSeconds = 6,
+            timeoutSeconds = AppConstants.Metrics.RAM_BATCH_TIMEOUT_SECONDS,
+        )
+        val zramRaw = command(
+            machine,
+            "for z in /sys/block/zram*; do [ -r \"\$z/disksize\" ] || continue; total=$(cat \"\$z/disksize\" 2>/dev/null); [ -n \"\$total\" ] || continue; [ \"\$total\" -gt 0 ] || continue; used=$(awk '{print \$1}' \"\$z/mm_stat\" 2>/dev/null); [ -n \"\$used\" ] || used=$(cat \"\$z/orig_data_size\" 2>/dev/null); [ -n \"\$used\" ] || continue; echo \"\$(basename \"\$z\")|\$used|\$total\"; exit 0; done",
+            "zram batch",
+            timeoutSeconds = AppConstants.Metrics.RAM_BATCH_TIMEOUT_SECONDS,
         )
         val values = parseKeyValue(ramBatch)
         val totalKb = fieldValue(values, "TOTAL_KB", "ram total")
         val availKb = fieldValue(values, "AVAIL_KB", "ram available")
+        val swapTotalKb = fieldValue(values, "SWAP_TOTAL_KB", "swap total")
+        val swapFreeKb = fieldValue(values, "SWAP_FREE_KB", "swap free")
 
         return RamMetrics(
             amount = kibToGbField(totalKb, "ram total"),
@@ -97,6 +111,8 @@ class MetricsCollector(
             speed = unavailable("hidden"),
             clock = unavailable("hidden"),
             usage = memoryUsage(totalKb, availKb),
+            zram = zramUsage(zramRaw),
+            swap = swapUsage(swapTotalKb, swapFreeKb),
         )
     }
 
@@ -107,14 +123,14 @@ class MetricsCollector(
             machine,
             "nvidia-smi --query-gpu=name,clocks.current.graphics,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true",
             "gpu nvidia",
-            timeoutSeconds = 6,
+            timeoutSeconds = AppConstants.Metrics.GPU_NVIDIA_TIMEOUT_SECONDS,
         )
 
         val inventoryText = command(
             machine,
             "echo __DRM__; for c in /sys/class/drm/card[0-9]*; do [ -e \"\$c/device/vendor\" ] || continue; slot=$(awk -F= '/^PCI_SLOT_NAME=/{print \$2; exit}' \"\$c/device/uevent\" 2>/dev/null); vendor=$(cat \"\$c/device/vendor\" 2>/dev/null); device=$(cat \"\$c/device/device\" 2>/dev/null); drv=$(basename \"$(readlink -f \"\$c/device/driver\" 2>/dev/null)\" 2>/dev/null); echo \"\$slot|\$vendor|\$device|\$drv\"; done; echo __LSPCI__; lspci -nn 2>/dev/null | grep -Ei '(vga compatible controller|3d controller|display controller)' || true",
             "gpu inventory",
-            timeoutSeconds = 6,
+            timeoutSeconds = AppConstants.Metrics.GPU_INVENTORY_TIMEOUT_SECONDS,
         )
 
         val inventoryLines = inventoryText.lines()
@@ -143,7 +159,7 @@ class MetricsCollector(
             machine,
             "ifaces=$(ip -o link show up | awk -F': ' '\$2 != \"lo\" {print \$2}'); t=$(mktemp); for i in \$ifaces; do iface=$(echo \"\$i\" | cut -d@ -f1); rx=$(cat /sys/class/net/\$iface/statistics/rx_bytes 2>/dev/null); tx=$(cat /sys/class/net/\$iface/statistics/tx_bytes 2>/dev/null); echo \"\$iface|\$rx|\$tx\" >> \"\$t\"; done; sleep 1; for i in \$ifaces; do iface=$(echo \"\$i\" | cut -d@ -f1); sp=$(cat /sys/class/net/\$iface/speed 2>/dev/null); mac=$(cat /sys/class/net/\$iface/address 2>/dev/null); ip=$(ip -4 addr show \$iface | awk '/inet / {print \$2; exit}'); rx2=$(cat /sys/class/net/\$iface/statistics/rx_bytes 2>/dev/null); tx2=$(cat /sys/class/net/\$iface/statistics/tx_bytes 2>/dev/null); p=$(grep \"^\$iface|\" \"\$t\" | head -n 1); rx1=$(echo \"\$p\" | cut -d'|' -f2); tx1=$(echo \"\$p\" | cut -d'|' -f3); [ -z \"\$rx1\" ] && rx1=0; [ -z \"\$tx1\" ] && tx1=0; drx=$((rx2-rx1)); dtx=$((tx2-tx1)); echo \"\$iface|\$sp|\$mac|\$ip|\$drx|\$dtx\"; done; rm -f \"\$t\"",
             "net summary",
-            timeoutSeconds = 12,
+            timeoutSeconds = AppConstants.Metrics.NETWORK_SUMMARY_TIMEOUT_SECONDS,
         )
 
         return parseNetworkSummary(networkSummary)
@@ -155,25 +171,37 @@ class MetricsCollector(
                 scope = machine.storageScopeMode,
                 used = unavailable("machine unreachable"),
                 total = unavailable("machine unreachable"),
+                items = emptyList(),
             )
         }
 
         val aggregateAllCommand =
             "df -B1 -x tmpfs -x devtmpfs --output=used,size | awk 'NR>1 {u+=\$1; s+=\$2} END {print u\" \"s}'"
-        val scopedCommand =
+        val detailedCommand =
+            "df -B1 -x tmpfs -x devtmpfs --output=source,used,size,target"
+        val summaryCommand = aggregateAllCommand
+        val detailCommand =
             when (machine.storageScopeMode) {
                 StorageScopeMode.ALL -> aggregateAllCommand
-                StorageScopeMode.PER_DEVICE ->
-                    "df -B1 -x tmpfs -x devtmpfs --output=source,used,size,target | awk 'NR>1 && \$4==\"/\" {src=\$1} NR>1 && src!=\"\" && \$1==src {u+=\$2; s+=\$3} END {if(src!=\"\") print u\" \"s}'"
-                StorageScopeMode.PER_MOUNT ->
-                    "df -B1 -x tmpfs -x devtmpfs --output=used,size,target | awk 'NR>1 && \$3==\"/\" {print \$1\" \"\$2; exit}'"
+                StorageScopeMode.PER_DEVICE, StorageScopeMode.PER_MOUNT -> detailedCommand
             }
 
-        val scopedResult = command(machine, scopedCommand, "storage", timeoutSeconds = 8)
-        val raw = if (scopedResult.isBlank()) {
-            command(machine, aggregateAllCommand, "storage", timeoutSeconds = 8)
+        val summaryResult = command(
+            machine,
+            summaryCommand,
+            "storage",
+            timeoutSeconds = AppConstants.Metrics.STORAGE_TIMEOUT_SECONDS,
+        )
+        val detailResult = command(
+            machine,
+            detailCommand,
+            "storage",
+            timeoutSeconds = AppConstants.Metrics.STORAGE_TIMEOUT_SECONDS,
+        )
+        val raw = if (summaryResult.isBlank()) {
+            detailResult
         } else {
-            scopedResult
+            summaryResult
         }
         val storageParts = raw.split(" ").filter { it.isNotBlank() }
 
@@ -181,10 +209,20 @@ class MetricsCollector(
             scope = machine.storageScopeMode,
             used = bytesToGbField(storageParts.getOrNull(0).orEmpty(), "storage used"),
             total = bytesToGbField(storageParts.getOrNull(1).orEmpty(), "storage total"),
+            items = if (machine.storageScopeMode == StorageScopeMode.ALL) {
+                emptyList()
+            } else {
+                parseStorageItems(detailResult, machine.storageScopeMode)
+            },
         )
     }
 
-    private suspend fun command(machine: MachineEntity, cmd: String, label: String, timeoutSeconds: Long = 6): String =
+    private suspend fun command(
+        machine: MachineEntity,
+        cmd: String,
+        label: String,
+        timeoutSeconds: Long = AppConstants.Metrics.DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    ): String =
         runCatching { commandExecutor.execute(machine, cmd, timeoutSeconds = timeoutSeconds) }
             .getOrElse { "UNAVAILABLE:$label:${it.message.orEmpty()}" }
             .trim()
@@ -203,6 +241,33 @@ class MetricsCollector(
 
     private fun fieldValue(values: Map<String, String>, key: String, label: String): String {
         return values[key] ?: "UNAVAILABLE:$label:missing"
+    }
+
+    private fun parseStorageItems(text: String, scopeMode: StorageScopeMode): List<StorageItemMetric> {
+        return text.lines()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("Filesystem") && !it.startsWith("UNAVAILABLE:") }
+            .mapNotNull { line ->
+                val parts = line.split(Regex("\\s+"), limit = 4)
+                if (parts.size < 4) return@mapNotNull null
+                val source = parts[0]
+                val usedRaw = parts[1]
+                val totalRaw = parts[2]
+                val target = parts[3]
+                val label = when (scopeMode) {
+                    StorageScopeMode.PER_DEVICE -> source
+                    StorageScopeMode.PER_MOUNT -> target
+                    StorageScopeMode.ALL -> source
+                }
+                val usedField = bytesToGbField(usedRaw, "storage used")
+                val totalField = bytesToGbField(totalRaw, "storage total")
+                StorageItemMetric(
+                    label = label,
+                    used = usedField,
+                    total = totalField,
+                    usage = storageUsageField(usedRaw, totalRaw),
+                )
+            }
     }
 
     private fun parseGpuMetrics(nvidiaText: String, drmText: String, lspciText: String): List<GpuMetric> {
@@ -385,6 +450,51 @@ class MetricsCollector(
         return available(String.format(Locale.US, "%.2f%% (%.2f GB / %.2f GB)", percent, usedGb, totalGb))
     }
 
+    private fun swapUsage(totalKb: String, freeKb: String): ResourceField {
+        val total = totalKb.toLongOrNull()
+        val free = freeKb.toLongOrNull()
+        if (total == null || free == null || total <= 0) {
+            return unavailable("swap usage unavailable")
+        }
+        val used = total - free
+        return usageFieldFromKb(used, total, "swap usage")
+    }
+
+    private fun zramUsage(raw: String): ResourceField {
+        if (raw.isBlank() || raw.startsWith("UNAVAILABLE:")) return unavailable("zram unavailable")
+        val parts = raw.split("|")
+        if (parts.size < 3) return unavailable("zram unavailable")
+        val used = parts.getOrNull(1)?.toLongOrNull()
+        val total = parts.getOrNull(2)?.toLongOrNull()
+        if (used == null || total == null || total <= 0) return unavailable("zram unavailable")
+        return usageFieldFromBytes(used, total, "zram usage")
+    }
+
+    private fun storageUsageField(usedRaw: String, totalRaw: String): ResourceField {
+        val used = usedRaw.toLongOrNull()
+        val total = totalRaw.toLongOrNull()
+        if (used == null || total == null || total <= 0) {
+            return unavailable("storage usage unavailable")
+        }
+        return available(String.format(Locale.US, "%.2f%%", (used * 100.0 / total)))
+    }
+
+    private fun usageFieldFromKb(usedKb: Long, totalKb: Long, label: String): ResourceField {
+        if (totalKb <= 0) return unavailable("$label unavailable")
+        val percent = (usedKb * 100.0 / totalKb)
+        val usedGb = usedKb.toDouble() * 1024.0 / (1024.0 * 1024.0 * 1024.0)
+        val totalGb = totalKb.toDouble() * 1024.0 / (1024.0 * 1024.0 * 1024.0)
+        return available(String.format(Locale.US, "%.2f%% (%.2f GB / %.2f GB)", percent, usedGb, totalGb))
+    }
+
+    private fun usageFieldFromBytes(usedBytes: Long, totalBytes: Long, label: String): ResourceField {
+        if (totalBytes <= 0) return unavailable("$label unavailable")
+        val percent = (usedBytes * 100.0 / totalBytes)
+        val usedGb = usedBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+        val totalGb = totalBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+        return available(String.format(Locale.US, "%.2f%% (%.2f GB / %.2f GB)", percent, usedGb, totalGb))
+    }
+
     private fun normalizeTemperature(raw: String): ResourceField {
         if (raw.startsWith("UNAVAILABLE:")) return raw.toField()
         val value = raw.toLongOrNull()
@@ -402,6 +512,25 @@ class MetricsCollector(
         if (raw.startsWith("UNAVAILABLE:")) return raw.toField()
         val value = raw.trim().toIntOrNull() ?: return unavailable("$label unavailable")
         return available(value.toString())
+    }
+
+    private fun totalCoresField(
+        coresPerSocketRaw: String?,
+        socketsRaw: String?,
+        fallbackRaw: String?,
+    ): ResourceField {
+        val coresPerSocket = coresPerSocketRaw?.trim()?.toLongOrNull()
+        val sockets = socketsRaw?.trim()?.toLongOrNull()
+        if (coresPerSocket != null && sockets != null && coresPerSocket > 0 && sockets > 0) {
+            return available((coresPerSocket * sockets).toString())
+        }
+
+        val fallback = fallbackRaw?.trim()?.toLongOrNull()
+        if (fallback != null && fallback > 0) {
+            return available(fallback.toString())
+        }
+
+        return unavailable("cpu cores unavailable")
     }
 
     private fun percentField(raw: String, label: String): ResourceField {
@@ -478,7 +607,8 @@ class MetricsCollector(
 
     private fun unavailableCpu(reason: String): CpuMetrics = CpuMetrics(
         name = unavailable(reason),
-        threadsPerCore = unavailable(reason),
+        threads = unavailable(reason),
+        cores = unavailable(reason),
         clock = unavailable(reason),
         usage = unavailable(reason),
         temperature = unavailable(reason),
@@ -490,6 +620,8 @@ class MetricsCollector(
         speed = unavailable(reason),
         clock = unavailable(reason),
         usage = unavailable(reason),
+        zram = unavailable(reason),
+        swap = unavailable(reason),
     )
 
     private fun unavailableGpu(reason: String): GpuMetric = GpuMetric(

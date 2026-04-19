@@ -10,7 +10,8 @@ data class ResourceField(
 
 data class CpuMetrics(
     val name: ResourceField,
-    val threadsPerCore: ResourceField,
+    val threads: ResourceField,
+    val cores: ResourceField,
     val clock: ResourceField,
     val usage: ResourceField,
     val temperature: ResourceField,
@@ -22,6 +23,8 @@ data class RamMetrics(
     val speed: ResourceField,
     val clock: ResourceField,
     val usage: ResourceField,
+    val zram: ResourceField,
+    val swap: ResourceField,
 )
 
 data class GpuMetric(
@@ -42,10 +45,18 @@ data class NetworkMetric(
     val mac: ResourceField,
 )
 
+data class StorageItemMetric(
+    val label: String,
+    val used: ResourceField,
+    val total: ResourceField,
+    val usage: ResourceField,
+)
+
 data class StorageMetric(
     val scope: StorageScopeMode,
     val used: ResourceField,
     val total: ResourceField,
+    val items: List<StorageItemMetric> = emptyList(),
 )
 
 data class MachineMetricsSnapshot(

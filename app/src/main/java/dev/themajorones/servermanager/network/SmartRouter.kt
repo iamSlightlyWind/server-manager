@@ -3,6 +3,7 @@ package dev.themajorones.servermanager.network
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import dev.themajorones.servermanager.config.AppConstants
 import dev.themajorones.servermanager.data.MachineEntity
 import dev.themajorones.servermanager.data.MachineRepository
 import java.net.InetSocketAddress
@@ -68,7 +69,7 @@ class SmartRouter(
         visited: MutableSet<Long>,
         diagnostics: MutableList<String>,
     ): List<Long>? {
-        if (depth >= 5) {
+        if (depth >= AppConstants.Routing.MAX_PARENT_DEPTH) {
             diagnostics += "parent_depth_limit_reached"
             return null
         }
@@ -96,7 +97,7 @@ class SmartRouter(
     private fun canConnect(host: String, port: Int): Boolean =
         runCatching {
             Socket().use { socket ->
-                socket.connect(InetSocketAddress(host, port), 1500)
+                socket.connect(InetSocketAddress(host, port), AppConstants.Routing.SOCKET_CONNECT_TIMEOUT_MS)
             }
             true
         }.getOrDefault(false)

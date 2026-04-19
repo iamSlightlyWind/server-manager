@@ -4,10 +4,14 @@ import android.util.Log
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
+import dev.themajorones.servermanager.config.AppConstants
 import dev.themajorones.servermanager.data.AuthMode
 import dev.themajorones.servermanager.data.MachineEntity
 import dev.themajorones.servermanager.security.CredentialStore
 import java.io.File
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.Locale
 import java.util.Properties
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
@@ -24,18 +28,22 @@ class SshSessionManager(
     private val sessionMutex = Mutex()
     private val commandMutexes = ConcurrentHashMap<Long, Mutex>()
 
-    override suspend fun execute(machine: MachineEntity, command: String, timeoutSeconds: Long): String =
+    override suspend fun execute(
+        machine: MachineEntity,
+        command: String,
+        timeoutSeconds: Long,
+    ): String =
         withContext(Dispatchers.IO) {
             val commandMutex = commandMutexes.getOrPut(machine.id) { Mutex() }
             commandMutex.withLock {
                 val session = getOrCreate(machine)
                 try {
-                    runCommand(session, command, timeoutSeconds)
+                    runCommand(machine, session, command, timeoutSeconds)
                 } catch (error: Exception) {
                     Log.w(tag, "Command failed on machine=${machine.id} host=${machine.host}, reconnecting", error)
                     invalidate(machine.id)
                     val retry = getOrCreate(machine)
-                    runCommand(retry, command, timeoutSeconds)
+                    runCommand(machine, retry, command, timeoutSeconds)
                 }
             }
         }
@@ -43,8 +51,10 @@ class SshSessionManager(
     override suspend fun isReachable(machine: MachineEntity, timeoutSeconds: Long): Boolean =
         withContext(Dispatchers.IO) {
             runCatching {
-                val output = execute(machine, "echo connected", timeoutSeconds)
-                output.contains("connected")
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(machine.host, machine.port), (timeoutSeconds * 1_000).toInt())
+                }
+                true
             }.onFailure { error ->
                 Log.w(tag, "Reachability failed machine=${machine.id} host=${machine.host}", error)
             }.getOrDefault(false)
@@ -93,12 +103,13 @@ class SshSessionManager(
                 }
             }
 
-            session.connect(8_000)
+            session.connect(AppConstants.Ssh.SESSION_CONNECT_TIMEOUT_MS)
             sessions[machine.id] = session
             session
         }
 
-    private fun runCommand(session: Session, command: String, timeoutSeconds: Long): String {
+    private fun runCommand(machine: MachineEntity, session: Session, command: String, timeoutSeconds: Long): String {
+        val startedAtNanos = System.nanoTime()
         val channel = session.openChannel("exec") as ChannelExec
         channel.setCommand(wrapInPosixShell(command))
         channel.setInputStream(null)
@@ -109,6 +120,12 @@ class SshSessionManager(
             val out = channel.inputStream.bufferedReader().readText().trim()
             return out
         } finally {
+            val elapsedSeconds = (System.nanoTime() - startedAtNanos) / 1_000_000_000.0
+            val commandPreview = command.replace("\n", " ").take(AppConstants.Ssh.COMMAND_PREVIEW_MAX_LENGTH)
+            Log.d(
+                tag,
+                "SSH command cost=${String.format(Locale.US, "%.2f", elapsedSeconds)}s machine=${machine.id}:${machine.host} cmd=\"$commandPreview\"",
+            )
             channel.disconnect()
         }
     }
