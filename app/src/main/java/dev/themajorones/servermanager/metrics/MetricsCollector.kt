@@ -179,6 +179,8 @@ class MetricsCollector(
             "df -B1 -x tmpfs -x devtmpfs --output=used,size | awk 'NR>1 {u+=\$1; s+=\$2} END {print u\" \"s}'"
         val detailedCommand =
             "df -B1 -x tmpfs -x devtmpfs --output=source,used,size,target"
+        val deviceMapCommand =
+            "lsblk -P -rno NAME,PKNAME,TYPE 2>/dev/null"
         val summaryCommand = aggregateAllCommand
         val detailCommand =
             when (machine.storageScopeMode) {
@@ -198,6 +200,16 @@ class MetricsCollector(
             "storage",
             timeoutSeconds = AppConstants.Metrics.STORAGE_TIMEOUT_SECONDS,
         )
+        val deviceMapResult = if (machine.storageScopeMode == StorageScopeMode.PER_DEVICE) {
+            command(
+                machine,
+                deviceMapCommand,
+                "storage device map",
+                timeoutSeconds = AppConstants.Metrics.STORAGE_TIMEOUT_SECONDS,
+            )
+        } else {
+            ""
+        }
         val raw = if (summaryResult.isBlank()) {
             detailResult
         } else {
@@ -212,7 +224,11 @@ class MetricsCollector(
             items = if (machine.storageScopeMode == StorageScopeMode.ALL) {
                 emptyList()
             } else {
-                parseStorageItems(detailResult, machine.storageScopeMode)
+                parseStorageItems(
+                    text = detailResult,
+                    scopeMode = machine.storageScopeMode,
+                    deviceParents = parseDeviceParents(deviceMapResult),
+                )
             },
         )
     }
@@ -243,32 +259,131 @@ class MetricsCollector(
         return values[key] ?: "UNAVAILABLE:$label:missing"
     }
 
-    private fun parseStorageItems(text: String, scopeMode: StorageScopeMode): List<StorageItemMetric> {
-        return text.lines()
+    private fun parseStorageItems(
+        text: String,
+        scopeMode: StorageScopeMode,
+        deviceParents: Map<String, String> = emptyMap(),
+    ): List<StorageItemMetric> {
+        val uniqueRows = linkedMapOf<String, StorageRow>()
+
+        text.lines()
             .map { it.trim() }
             .filter { it.isNotEmpty() && !it.startsWith("Filesystem") && !it.startsWith("UNAVAILABLE:") }
             .mapNotNull { line ->
                 val parts = line.split(Regex("\\s+"), limit = 4)
                 if (parts.size < 4) return@mapNotNull null
-                val source = parts[0]
+                val rawSource = parts[0].trim()
+                val source = normalizeStorageName(rawSource)
                 val usedRaw = parts[1]
                 val totalRaw = parts[2]
                 val target = parts[3]
-                val label = when (scopeMode) {
-                    StorageScopeMode.PER_DEVICE -> source
-                    StorageScopeMode.PER_MOUNT -> target
+
+                // Device/partition views should only show block devices from /dev.
+                if ((scopeMode == StorageScopeMode.PER_DEVICE || scopeMode == StorageScopeMode.PER_MOUNT) && !rawSource.startsWith("/dev/")) {
+                    return@mapNotNull null
+                }
+
+                val usedBytes = usedRaw.toLongOrNull() ?: 0L
+                val totalBytes = totalRaw.toLongOrNull() ?: 0L
+                uniqueRows[source] = StorageRow(
+                    source = source,
+                    used = usedBytes,
+                    total = totalBytes,
+                    target = target,
+                )
+                when (scopeMode) {
+                    StorageScopeMode.PER_DEVICE -> resolvePhysicalDeviceLabel(source, deviceParents)
+                    StorageScopeMode.PER_MOUNT -> source
                     StorageScopeMode.ALL -> source
                 }
-                val usedField = bytesToGbField(usedRaw, "storage used")
-                val totalField = bytesToGbField(totalRaw, "storage total")
+                Unit
+            }
+
+        return when (scopeMode) {
+            StorageScopeMode.PER_DEVICE -> {
+                val aggregated = linkedMapOf<String, MutableLongPair>()
+                uniqueRows.values.forEach { row ->
+                    val label = resolvePhysicalDeviceLabel(row.source, deviceParents)
+                    val current = aggregated.getOrPut(label) { MutableLongPair() }
+                    current.used += row.used
+                    current.total += row.total
+                }
+                aggregated.map { (label, totals) ->
+                    val usedRaw = totals.used.toString()
+                    val totalRaw = totals.total.toString()
+                    StorageItemMetric(
+                        label = label,
+                        used = bytesToGbField(usedRaw, "storage used"),
+                        total = bytesToGbField(totalRaw, "storage total"),
+                        usage = storageUsageField(usedRaw, totalRaw),
+                    )
+                }
+            }
+
+            StorageScopeMode.PER_MOUNT -> uniqueRows.values.map { row ->
+                val usedRaw = row.used.toString()
+                val totalRaw = row.total.toString()
                 StorageItemMetric(
-                    label = label,
-                    used = usedField,
-                    total = totalField,
+                    label = row.source,
+                    used = bytesToGbField(usedRaw, "storage used"),
+                    total = bytesToGbField(totalRaw, "storage total"),
                     usage = storageUsageField(usedRaw, totalRaw),
                 )
             }
+
+            StorageScopeMode.ALL -> emptyList()
+        }
     }
+
+    private fun parseDeviceParents(text: String): Map<String, String> {
+        val pairs = text.lines()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("UNAVAILABLE:") }
+            .mapNotNull { line ->
+                val values = parseLsblkPairs(line)
+                val name = normalizeStorageName(values["NAME"].orEmpty())
+                val parent = normalizeStorageName(values["PKNAME"].orEmpty())
+                if (name.isBlank() || parent.isBlank()) return@mapNotNull null
+                name to parent
+            }
+        return pairs.toMap()
+    }
+
+    private fun parseLsblkPairs(line: String): Map<String, String> {
+        val regex = Regex("([A-Z]+)=\"([^\"]*)\"")
+        return regex.findAll(line).associate { match ->
+            match.groupValues[1] to match.groupValues[2]
+        }
+    }
+
+    private fun resolvePhysicalDeviceLabel(source: String, parents: Map<String, String>): String {
+        val root = generateSequence(source) { parents[it] }
+            .lastOrNull()
+            .orEmpty()
+        return if (root.isBlank()) {
+            "/dev/$source"
+        } else {
+            "/dev/$root"
+        }
+    }
+
+    private fun normalizeStorageName(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isBlank()) return ""
+        return trimmed.substringAfterLast('/')
+    }
+
+    private data class MutableLongPair(
+        var used: Long = 0L,
+        var total: Long = 0L,
+    )
+
+    private data class StorageRow(
+        val source: String,
+        val used: Long,
+        val total: Long,
+        val target: String,
+    )
 
     private fun parseGpuMetrics(nvidiaText: String, drmText: String, lspciText: String): List<GpuMetric> {
         val result = mutableListOf<GpuMetric>()

@@ -26,7 +26,6 @@ class SshSessionManager(
     private val tag = "SshSessionManager"
     private val sessions = ConcurrentHashMap<Long, Session>()
     private val sessionMutex = Mutex()
-    private val commandMutexes = ConcurrentHashMap<Long, Mutex>()
 
     override suspend fun execute(
         machine: MachineEntity,
@@ -34,17 +33,14 @@ class SshSessionManager(
         timeoutSeconds: Long,
     ): String =
         withContext(Dispatchers.IO) {
-            val commandMutex = commandMutexes.getOrPut(machine.id) { Mutex() }
-            commandMutex.withLock {
-                val session = getOrCreate(machine)
-                try {
-                    runCommand(machine, session, command, timeoutSeconds)
-                } catch (error: Exception) {
-                    Log.w(tag, "Command failed on machine=${machine.id} host=${machine.host}, reconnecting", error)
-                    invalidate(machine.id)
-                    val retry = getOrCreate(machine)
-                    runCommand(machine, retry, command, timeoutSeconds)
-                }
+            val session = getOrCreate(machine)
+            try {
+                runCommand(machine, session, command, timeoutSeconds)
+            } catch (error: Exception) {
+                Log.w(tag, "Command failed on machine=${machine.id} host=${machine.host}, reconnecting", error)
+                invalidate(machine.id)
+                val retry = getOrCreate(machine)
+                runCommand(machine, retry, command, timeoutSeconds)
             }
         }
 

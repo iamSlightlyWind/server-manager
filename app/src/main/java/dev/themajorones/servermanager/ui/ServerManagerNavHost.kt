@@ -81,10 +81,13 @@ import dev.themajorones.servermanager.ui.charts.SparklineChart
 import java.util.Locale
 import kotlin.math.max
 import java.util.concurrent.CancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.supervisorScope
 
 @Composable
 fun ServerManagerNavHost(container: AppContainer) {
@@ -494,7 +497,7 @@ private fun MachineDetailScreen(
     val storageHistory = remember { mutableStateListOf<Float>() }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(machine?.id, machine?.storageScopeMode) {
+    LaunchedEffect(machine?.id) {
         val current = machine ?: return@LaunchedEffect
 
         cpu = null
@@ -520,8 +523,9 @@ private fun MachineDetailScreen(
 
         while (true) {
             val cycleStartedAt = System.currentTimeMillis()
+            val activeMachine = container.machineRepository.getMachine(current.id) ?: current
             val route = try {
-                container.metricsCollector.resolveRoute(current)
+                container.metricsCollector.resolveRoute(activeMachine)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -553,75 +557,89 @@ private fun MachineDetailScreen(
 
             refreshError = null
 
-            cpu = try {
-                container.metricsCollector.collectCpu(current, route)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                unavailableCpuUi(error.message ?: "cpu collection failed")
-            }
-            parsePercentValue(cpu?.usage?.value)?.let { appendHistory(cpuHistory, it) }
-            cpuLoading = false
-
-            ram = try {
-                container.metricsCollector.collectRam(current, route)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                unavailableRamUi(error.message ?: "ram collection failed")
-            }
-            parsePercentValue(ram?.usage?.value)?.let { appendHistory(ramHistory, it) }
-            ramLoading = false
-
-            gpus = try {
-                container.metricsCollector.collectGpus(current, route)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                listOf(unavailableGpuUi(error.message ?: "gpu collection failed"))
-            }
-            val primaryGpu = gpus?.firstOrNull()
-            parsePercentValue(primaryGpu?.usage?.value)?.let { appendHistory(gpuUsageHistory, it) }
-            parseGbValue(primaryGpu?.vram?.value)?.let { totalGb ->
-                parsePercentValue(primaryGpu?.vramUsage?.value)?.let { percent ->
-                    appendHistory(gpuVramUsedHistory, totalGb * (percent / 100f))
+            supervisorScope {
+                val cpuJob = async {
+                    cpu = try {
+                        container.metricsCollector.collectCpu(activeMachine, route)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        unavailableCpuUi(error.message ?: "cpu collection failed")
+                    }
+                    parsePercentValue(cpu?.usage?.value)?.let { appendHistory(cpuHistory, it) }
+                    cpuLoading = false
                 }
-            }
-            parsePercentValue(primaryGpu?.vramUsage?.value)?.let { appendHistory(gpuVramUsageHistory, it) }
-            parseNumericValue(primaryGpu?.powerDraw?.value)?.let { appendHistory(gpuPowerDrawHistory, it) }
-            gpuLoading = false
 
-            networks = try {
-                container.metricsCollector.collectNetworks(current, route)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                refreshError = "network: ${error.message ?: "collection failed"}"
-                emptyList()
-            }
-            val networkDownTotal = sumThroughputMbps(networks?.map { it.currentDown.value })
-            val networkUpTotal = sumThroughputMbps(networks?.map { it.currentUp.value })
-            networkDownTotal?.let {
-                appendHistory(networkDownHistory, it, maxPoints = AppConstants.Graph.HISTORY_MAX_POINTS)
-            }
-            networkUpTotal?.let {
-                appendHistory(networkUpHistory, it, maxPoints = AppConstants.Graph.HISTORY_MAX_POINTS)
-            }
-            networkLoading = false
+                val ramJob = async {
+                    ram = try {
+                        container.metricsCollector.collectRam(activeMachine, route)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        unavailableRamUi(error.message ?: "ram collection failed")
+                    }
+                    parsePercentValue(ram?.usage?.value)?.let { appendHistory(ramHistory, it) }
+                    ramLoading = false
+                }
 
-            storage = try {
-                container.metricsCollector.collectStorage(current, route)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                StorageMetric(
-                    scope = current.storageScopeMode,
-                    used = unavailable(error.message ?: "storage collection failed"),
-                    total = unavailable(error.message ?: "storage collection failed"),
-                )
+                val gpuJob = async {
+                    gpus = try {
+                        container.metricsCollector.collectGpus(activeMachine, route)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        listOf(unavailableGpuUi(error.message ?: "gpu collection failed"))
+                    }
+                    val primaryGpu = gpus?.firstOrNull()
+                    parsePercentValue(primaryGpu?.usage?.value)?.let { appendHistory(gpuUsageHistory, it) }
+                    parseGbValue(primaryGpu?.vram?.value)?.let { totalGb ->
+                        parsePercentValue(primaryGpu?.vramUsage?.value)?.let { percent ->
+                            appendHistory(gpuVramUsedHistory, totalGb * (percent / 100f))
+                        }
+                    }
+                    parsePercentValue(primaryGpu?.vramUsage?.value)?.let { appendHistory(gpuVramUsageHistory, it) }
+                    parseNumericValue(primaryGpu?.powerDraw?.value)?.let { appendHistory(gpuPowerDrawHistory, it) }
+                    gpuLoading = false
+                }
+
+                val networkJob = async {
+                    networks = try {
+                        container.metricsCollector.collectNetworks(activeMachine, route)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        refreshError = "network: ${error.message ?: "collection failed"}"
+                        emptyList()
+                    }
+                    val networkDownTotal = sumThroughputMbps(networks?.map { it.currentDown.value })
+                    val networkUpTotal = sumThroughputMbps(networks?.map { it.currentUp.value })
+                    networkDownTotal?.let {
+                        appendHistory(networkDownHistory, it, maxPoints = AppConstants.Graph.HISTORY_MAX_POINTS)
+                    }
+                    networkUpTotal?.let {
+                        appendHistory(networkUpHistory, it, maxPoints = AppConstants.Graph.HISTORY_MAX_POINTS)
+                    }
+                    networkLoading = false
+                }
+
+                val storageJob = async {
+                    storage = try {
+                        container.metricsCollector.collectStorage(activeMachine, route)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        StorageMetric(
+                            scope = activeMachine.storageScopeMode,
+                            used = unavailable(error.message ?: "storage collection failed"),
+                            total = unavailable(error.message ?: "storage collection failed"),
+                        )
+                    }
+                    parseStorageUsagePercent(storage)?.let { appendHistory(storageHistory, it) }
+                    storageLoading = false
+                }
+
+                joinAll(cpuJob, ramJob, gpuJob, networkJob, storageJob)
             }
-            parseStorageUsagePercent(storage)?.let { appendHistory(storageHistory, it) }
-            storageLoading = false
 
             val elapsed = System.currentTimeMillis() - cycleStartedAt
             delay(max(0L, AppConstants.Refresh.MACHINE_DETAIL_INTERVAL_MS - elapsed))
@@ -677,7 +695,7 @@ private fun MachineDetailScreen(
                             onClick = {},
                             label = { Text("Refresh ~${AppConstants.Refresh.MACHINE_DETAIL_INTERVAL_MS / 1_000}s") },
                         )
-                        AssistChip(onClick = {}, label = { Text(current.storageScopeMode.name) })
+                        AssistChip(onClick = {}, label = { Text(storageScopeLabel(current.storageScopeMode)) })
                     }
                 }
             }
@@ -1109,7 +1127,7 @@ private fun StorageScopePicker(scopeMode: StorageScopeMode, onChange: (StorageSc
     var expanded by remember { mutableStateOf(false) }
     ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
         OutlinedTextField(
-            value = scopeMode.name,
+            value = storageScopeLabel(scopeMode),
             onValueChange = {},
             readOnly = true,
             label = { Text("Storage scope") },
@@ -1121,7 +1139,7 @@ private fun StorageScopePicker(scopeMode: StorageScopeMode, onChange: (StorageSc
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             StorageScopeMode.entries.forEach { mode ->
                 DropdownMenuItem(
-                    text = { Text(mode.name) },
+                    text = { Text(storageScopeLabel(mode)) },
                     onClick = {
                         expanded = false
                         onChange(mode)
@@ -1144,6 +1162,14 @@ private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Un
             Spacer(modifier = Modifier.height(8.dp))
             content()
         }
+    }
+}
+
+private fun storageScopeLabel(scopeMode: StorageScopeMode): String {
+    return when (scopeMode) {
+        StorageScopeMode.ALL -> "All"
+        StorageScopeMode.PER_DEVICE -> "Per device"
+        StorageScopeMode.PER_MOUNT -> "Per partition"
     }
 }
 
