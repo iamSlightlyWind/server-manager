@@ -4,6 +4,7 @@ object AppConstants {
     object Refresh {
         const val MACHINE_LIST_INTERVAL_MS: Long = 1_000L
         const val MACHINE_DETAIL_INTERVAL_MS: Long = 1_000L
+        const val MACHINE_LIST_DISCOVERY_INTERVAL_MS: Long = 15_000L
     }
 
     object Graph {
@@ -19,6 +20,8 @@ object AppConstants {
     object Ssh {
         const val DEFAULT_COMMAND_TIMEOUT_SECONDS: Long = 20L
         const val DEFAULT_REACHABILITY_TIMEOUT_SECONDS: Long = 4L
+        const val MACHINE_LIST_REACHABILITY_TIMEOUT_SECONDS: Long = 1L
+        const val MACHINE_LIST_DISCOVERY_TIMEOUT_SECONDS: Long = 3L
         const val SESSION_CONNECT_TIMEOUT_MS: Int = 8_000
         const val COMMAND_PREVIEW_MAX_LENGTH: Int = 120
     }

@@ -31,9 +31,11 @@ data class GpuMetric(
     val name: ResourceField,
     val clock: ResourceField,
     val vram: ResourceField,
+    val vramUsage: ResourceField,
     val generation: ResourceField,
     val speed: ResourceField,
     val usage: ResourceField,
+    val powerDraw: ResourceField,
 )
 
 data class NetworkMetric(

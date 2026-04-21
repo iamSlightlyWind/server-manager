@@ -121,7 +121,7 @@ class MetricsCollector(
 
         val nvidiaText = command(
             machine,
-            "nvidia-smi --query-gpu=name,clocks.current.graphics,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true",
+            "nvidia-smi --query-gpu=name,clocks.current.graphics,memory.used,memory.total,utilization.gpu,power.draw --format=csv,noheader,nounits 2>/dev/null || true",
             "gpu nvidia",
             timeoutSeconds = AppConstants.Metrics.GPU_NVIDIA_TIMEOUT_SECONDS,
         )
@@ -285,19 +285,23 @@ class MetricsCollector(
             .filter { it.isNotEmpty() && !it.startsWith("UNAVAILABLE:") }
         nvidiaRows.forEach { line ->
             val parts = line.split(",").map { it.trim() }
-            if (parts.size >= 4) {
+            if (parts.size >= 6) {
                 val name = parts[0]
                 val clock = parts[1]
-                val vram = parts[2]
-                val usage = parts[3]
+                val vramUsed = parts[2]
+                val vramTotal = parts[3]
+                val usage = parts[4]
+                val powerDraw = parts[5]
                 add(
                     GpuMetric(
                         name = available(name),
                         clock = mhzToGhzField(clock, "gpu clock"),
-                        vram = mibToGbField(vram, "gpu vram"),
+                        vram = mibToGbField(vramTotal, "gpu vram"),
+                        vramUsage = gpuVramUsageField(vramUsed, vramTotal),
                         generation = mapGpuGeneration(name),
                         speed = mhzToGhzField(clock, "gpu speed"),
                         usage = percentField(usage, "gpu usage"),
+                        powerDraw = gpuPowerField(powerDraw),
                     ),
                 )
             }
@@ -340,9 +344,11 @@ class MetricsCollector(
                     name = available(gpuName),
                     clock = unavailable("not exposed by driver"),
                     vram = unavailable("not exposed by driver"),
+                    vramUsage = unavailable("not exposed by driver"),
                     generation = mapGpuGeneration(gpuName),
                     speed = unavailable("not exposed by driver"),
                     usage = unavailable("not exposed by driver"),
+                    powerDraw = unavailable("not exposed by driver"),
                 ),
             )
         }
@@ -358,9 +364,11 @@ class MetricsCollector(
                     name = available(gpuName),
                     clock = unavailable("clock unavailable"),
                     vram = unavailable("vram unavailable"),
+                    vramUsage = unavailable("vram usage unavailable"),
                     generation = mapGpuGeneration(gpuName),
                     speed = unavailable("speed unavailable"),
                     usage = unavailable("usage unavailable"),
+                    powerDraw = unavailable("power draw unavailable"),
                 ),
             )
         }
@@ -372,9 +380,11 @@ class MetricsCollector(
                         name = available(gpuName),
                         clock = unavailable("clock unavailable"),
                         vram = unavailable("vram unavailable"),
+                        vramUsage = unavailable("vram usage unavailable"),
                         generation = mapGpuGeneration(gpuName),
                         speed = unavailable("speed unavailable"),
                         usage = unavailable("usage unavailable"),
+                        powerDraw = unavailable("power draw unavailable"),
                     ),
                 )
             }
@@ -477,6 +487,26 @@ class MetricsCollector(
             return unavailable("storage usage unavailable")
         }
         return available(String.format(Locale.US, "%.2f%%", (used * 100.0 / total)))
+    }
+
+    private fun gpuVramUsageField(usedRaw: String, totalRaw: String): ResourceField {
+        val used = usedRaw.toDoubleOrNull()
+        val total = totalRaw.toDoubleOrNull()
+        if (used == null || total == null || total <= 0.0) {
+            return unavailable("vram usage unavailable")
+        }
+        val percent = (used * 100.0 / total)
+        return available(String.format(Locale.US, "%.2f%%", percent))
+    }
+
+    private fun gpuPowerField(raw: String): ResourceField {
+        val value = raw.trim()
+        if (value.isBlank()) return unavailable("power draw unavailable")
+        if (value.equals("n/a", ignoreCase = true) || value.equals("[not supported]", ignoreCase = true)) {
+            return unavailable("power draw unavailable")
+        }
+        val watts = value.toDoubleOrNull() ?: return unavailable("power draw unavailable")
+        return available(String.format(Locale.US, "%.2f W", watts))
     }
 
     private fun usageFieldFromKb(usedKb: Long, totalKb: Long, label: String): ResourceField {
@@ -628,9 +658,11 @@ class MetricsCollector(
         name = unavailable(reason),
         clock = unavailable(reason),
         vram = unavailable(reason),
+        vramUsage = unavailable(reason),
         generation = unavailable(reason),
         speed = unavailable(reason),
         usage = unavailable(reason),
+        powerDraw = unavailable(reason),
     )
 
     private fun String.toField(): ResourceField {

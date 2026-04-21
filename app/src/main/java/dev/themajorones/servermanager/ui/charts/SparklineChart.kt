@@ -16,6 +16,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 
 @Composable
@@ -28,6 +29,7 @@ fun SparklineChart(
     max: Float = 100f,
     autoScale: Boolean = true,
     showStats: Boolean = false,
+    valueFormatter: (Float) -> String = { value -> String.format(java.util.Locale.US, "%.1f%%", value) },
 ) {
     Canvas(
         modifier = modifier
@@ -102,25 +104,70 @@ fun SparklineChart(
             val minIndex = values.indices.minByOrNull { values[it] } ?: 0
             val maxPoint = points[maxIndex]
             val minPoint = points[minIndex]
+            val placedBounds = mutableListOf<RectF>()
+
+            fun overlapsExisting(candidate: RectF): Boolean =
+                placedBounds.any { RectF.intersects(it, candidate) }
+
+            fun drawLabel(canvas: android.graphics.Canvas, text: String, anchor: Offset, preferredOffsets: List<Offset>) {
+                val padding = 8f
+                val textWidth = statsPaint.measureText(text)
+                val textHeight = statsPaint.textSize
+
+                val offsets = preferredOffsets + Offset(12f, -12f)
+                for (offset in offsets) {
+                    val desiredX = anchor.x + offset.x
+                    val desiredY = anchor.y + offset.y
+                    val clampedX = desiredX.coerceIn(padding, size.width - textWidth - padding)
+                    val clampedY = desiredY.coerceIn(textHeight + padding, size.height - padding)
+                    val bounds = RectF(clampedX, clampedY - textHeight, clampedX + textWidth, clampedY)
+                    if (!overlapsExisting(bounds)) {
+                        canvas.drawText(text, clampedX, clampedY, statsPaint)
+                        placedBounds += bounds
+                        return
+                    }
+                }
+
+                val fallbackX = (anchor.x + 12f).coerceIn(padding, size.width - textWidth - padding)
+                val fallbackY = (anchor.y - 12f).coerceIn(textHeight + padding, size.height - padding)
+                val fallbackBounds = RectF(fallbackX, fallbackY - textHeight, fallbackX + textWidth, fallbackY)
+                canvas.drawText(text, fallbackX, fallbackY, statsPaint)
+                placedBounds += fallbackBounds
+            }
 
             drawIntoCanvas { canvas ->
-                canvas.nativeCanvas.drawText(
-                    String.format(java.util.Locale.US, "Current %.1f%%", currentValue),
-                    lastPoint.x + 12f,
-                    (lastPoint.y - 12f).coerceAtLeast(30f),
-                    statsPaint,
+                drawLabel(
+                    canvas.nativeCanvas,
+                    "Current ${valueFormatter(currentValue)}",
+                    lastPoint,
+                    preferredOffsets = listOf(
+                        Offset(12f, -12f),
+                        Offset(-140f, -12f),
+                        Offset(-140f, 28f),
+                        Offset(12f, 28f),
+                    ),
                 )
-                canvas.nativeCanvas.drawText(
-                    String.format(java.util.Locale.US, "Max %.1f%%", values[maxIndex]),
-                    maxPoint.x + 12f,
-                    (maxPoint.y - 12f).coerceAtLeast(30f),
-                    statsPaint,
+                drawLabel(
+                    canvas.nativeCanvas,
+                    "Max ${valueFormatter(values[maxIndex])}",
+                    maxPoint,
+                    preferredOffsets = listOf(
+                        Offset(12f, -22f),
+                        Offset(-140f, -22f),
+                        Offset(12f, 26f),
+                        Offset(-140f, 26f),
+                    ),
                 )
-                canvas.nativeCanvas.drawText(
-                    String.format(java.util.Locale.US, "Min %.1f%%", values[minIndex]),
-                    minPoint.x + 12f,
-                    (minPoint.y - 12f).coerceAtLeast(30f),
-                    statsPaint,
+                drawLabel(
+                    canvas.nativeCanvas,
+                    "Min ${valueFormatter(values[minIndex])}",
+                    minPoint,
+                    preferredOffsets = listOf(
+                        Offset(12f, -22f),
+                        Offset(-140f, -22f),
+                        Offset(12f, 26f),
+                        Offset(-140f, 26f),
+                    ),
                 )
             }
         }

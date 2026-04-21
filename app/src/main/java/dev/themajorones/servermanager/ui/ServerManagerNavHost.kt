@@ -1,5 +1,6 @@
 package dev.themajorones.servermanager.ui
 
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -145,34 +146,64 @@ private fun MachineListScreen(
     onOpenDetail: (Long) -> Unit,
     onCreate: () -> Unit,
 ) {
+    val tag = "MachineListScreen"
     val machines by container.machineRepository.observeMachines().collectAsStateCompat(emptyList())
     val scope = rememberCoroutineScope()
+    val lastDiscoveryAt = remember { mutableMapOf<Long, Long>() }
+    val inFlight = remember { mutableMapOf<Long, Boolean>() }
 
     LaunchedEffect(machines.map { it.id }) {
         while (true) {
             machines.forEach { machine ->
                 scope.launch {
-                    val reachable = container.sshSessionManager.isReachable(machine)
-                    container.machineRepository.updateReachability(machine.id, reachable)
-                    if (reachable) {
-                        val discovery = runCatching {
-                            container.sshSessionManager.execute(
-                                machine,
-                                "echo HOSTNAME=\$(hostname); echo OS=\$(cat /etc/os-release | awk -F= '/^PRETTY_NAME=/{gsub(/\"/,\"\",\$2);print \$2}' | head -n 1); echo UPTIME=\$(cut -d. -f1 /proc/uptime)",
-                            )
-                        }.getOrNull()
-                        val values = discovery
-                            ?.lines()
-                            ?.mapNotNull { line ->
-                                val separator = line.indexOf('=')
-                                if (separator <= 0) null else line.substring(0, separator).trim() to line.substring(separator + 1).trim()
+                    if (inFlight[machine.id] == true) {
+                        return@launch
+                    }
+                    inFlight[machine.id] = true
+                    try {
+                        val reachStartedAt = System.nanoTime()
+                        val reachable = container.sshSessionManager.isReachable(
+                            machine,
+                            timeoutSeconds = AppConstants.Ssh.MACHINE_LIST_REACHABILITY_TIMEOUT_SECONDS,
+                        )
+                        container.machineRepository.updateReachability(machine.id, reachable)
+                        val reachElapsedSeconds = (System.nanoTime() - reachStartedAt) / 1_000_000_000.0
+                        Log.d(tag, "Reachability cost=${String.format(Locale.US, "%.2f", reachElapsedSeconds)}s machine=${machine.id}:${machine.host} reachable=$reachable")
+
+                        if (reachable) {
+                            val now = System.currentTimeMillis()
+                            val lastAt = lastDiscoveryAt[machine.id] ?: 0L
+                            val shouldRefreshDiscovery =
+                                machine.discoveredHostname.isNullOrBlank() ||
+                                    machine.discoveredOs.isNullOrBlank() ||
+                                    machine.uptimeSeconds == null ||
+                                    (now - lastAt) >= AppConstants.Refresh.MACHINE_LIST_DISCOVERY_INTERVAL_MS
+
+                            if (shouldRefreshDiscovery) {
+                                val discovery = runCatching {
+                                    container.sshSessionManager.execute(
+                                        machine,
+                                        "echo HOSTNAME=\$(hostname); echo OS=\$(cat /etc/os-release | awk -F= '/^PRETTY_NAME=/{gsub(/\"/,\"\",\$2);print \$2}' | head -n 1); echo UPTIME=\$(cut -d. -f1 /proc/uptime)",
+                                        timeoutSeconds = AppConstants.Ssh.MACHINE_LIST_DISCOVERY_TIMEOUT_SECONDS,
+                                    )
+                                }.getOrNull()
+                                val values = discovery
+                                    ?.lines()
+                                    ?.mapNotNull { line ->
+                                        val separator = line.indexOf('=')
+                                        if (separator <= 0) null else line.substring(0, separator).trim() to line.substring(separator + 1).trim()
+                                    }
+                                    ?.toMap()
+                                    .orEmpty()
+                                val hostname = values["HOSTNAME"]
+                                val os = values["OS"]
+                                val uptime = values["UPTIME"]?.toLongOrNull()
+                                container.machineRepository.updateDiscovery(machine.id, hostname, os, uptime)
+                                lastDiscoveryAt[machine.id] = now
                             }
-                            ?.toMap()
-                            .orEmpty()
-                        val hostname = values["HOSTNAME"]
-                        val os = values["OS"]
-                        val uptime = values["UPTIME"]?.toLongOrNull()
-                        container.machineRepository.updateDiscovery(machine.id, hostname, os, uptime)
+                        }
+                    } finally {
+                        inFlight[machine.id] = false
                     }
                 }
             }
@@ -454,6 +485,10 @@ private fun MachineDetailScreen(
     var storageLoading by remember { mutableStateOf(true) }
     val cpuHistory = remember { mutableStateListOf<Float>() }
     val ramHistory = remember { mutableStateListOf<Float>() }
+    val gpuUsageHistory = remember { mutableStateListOf<Float>() }
+    val gpuVramUsedHistory = remember { mutableStateListOf<Float>() }
+    val gpuVramUsageHistory = remember { mutableStateListOf<Float>() }
+    val gpuPowerDrawHistory = remember { mutableStateListOf<Float>() }
     val networkDownHistory = remember { mutableStateListOf<Float>() }
     val networkUpHistory = remember { mutableStateListOf<Float>() }
     val storageHistory = remember { mutableStateListOf<Float>() }
@@ -474,6 +509,10 @@ private fun MachineDetailScreen(
         storageLoading = true
         cpuHistory.clear()
         ramHistory.clear()
+        gpuUsageHistory.clear()
+        gpuVramUsedHistory.clear()
+        gpuVramUsageHistory.clear()
+        gpuPowerDrawHistory.clear()
         networkDownHistory.clear()
         networkUpHistory.clear()
         storageHistory.clear()
@@ -541,6 +580,15 @@ private fun MachineDetailScreen(
             } catch (error: Exception) {
                 listOf(unavailableGpuUi(error.message ?: "gpu collection failed"))
             }
+            val primaryGpu = gpus?.firstOrNull()
+            parsePercentValue(primaryGpu?.usage?.value)?.let { appendHistory(gpuUsageHistory, it) }
+            parseGbValue(primaryGpu?.vram?.value)?.let { totalGb ->
+                parsePercentValue(primaryGpu?.vramUsage?.value)?.let { percent ->
+                    appendHistory(gpuVramUsedHistory, totalGb * (percent / 100f))
+                }
+            }
+            parsePercentValue(primaryGpu?.vramUsage?.value)?.let { appendHistory(gpuVramUsageHistory, it) }
+            parseNumericValue(primaryGpu?.powerDraw?.value)?.let { appendHistory(gpuPowerDrawHistory, it) }
             gpuLoading = false
 
             networks = try {
@@ -551,11 +599,12 @@ private fun MachineDetailScreen(
                 refreshError = "network: ${error.message ?: "collection failed"}"
                 emptyList()
             }
-            val primaryNetwork = networks?.firstOrNull()
-            parseThroughputMbps(primaryNetwork?.currentDown?.value)?.let {
+            val networkDownTotal = sumThroughputMbps(networks?.map { it.currentDown.value })
+            val networkUpTotal = sumThroughputMbps(networks?.map { it.currentUp.value })
+            networkDownTotal?.let {
                 appendHistory(networkDownHistory, it, maxPoints = AppConstants.Graph.HISTORY_MAX_POINTS)
             }
-            parseThroughputMbps(primaryNetwork?.currentUp?.value)?.let {
+            networkUpTotal?.let {
                 appendHistory(networkUpHistory, it, maxPoints = AppConstants.Graph.HISTORY_MAX_POINTS)
             }
             networkLoading = false
@@ -731,17 +780,59 @@ private fun MachineDetailScreen(
 
             item {
                 if (gpuLoading && gpus == null) {
-                    SkeletonSectionCard("GPU", lines = 5)
+                    SkeletonSectionCard("GPU", lines = 8)
                 } else {
                     SectionCard("GPU") {
                         val gpuData = gpus ?: listOf(unavailableGpuUi("gpu unavailable"))
+                        val primaryGpu = gpuData.firstOrNull()
+
+                        if (gpuUsageHistory.isNotEmpty()) {
+                            Text("GPU usage trend", style = MaterialTheme.typography.labelLarge)
+                            SparklineChart(
+                                values = gpuUsageHistory.toList(),
+                                color = MaterialTheme.colorScheme.primary,
+                                min = 0f,
+                                max = 100f,
+                                showStats = true,
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
+
+                        if (gpuVramUsageHistory.isNotEmpty()) {
+                            Text("GPU VRAM usage trend", style = MaterialTheme.typography.labelLarge)
+                            SparklineChart(
+                                values = if (gpuVramUsedHistory.isEmpty()) listOf(0f, 0f) else gpuVramUsedHistory.toList(),
+                                color = MaterialTheme.colorScheme.secondary,
+                                min = 0f,
+                                max = chartUpperBound(gpuVramUsedHistory),
+                                showStats = true,
+                                valueFormatter = { value -> String.format(Locale.US, "%.2f GB", value) },
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
+
+                        if (primaryGpu?.powerDraw?.isAvailable == true || gpuPowerDrawHistory.isNotEmpty()) {
+                            Text("GPU power draw trend", style = MaterialTheme.typography.labelLarge)
+                            SparklineChart(
+                                values = if (gpuPowerDrawHistory.isEmpty()) listOf(0f, 0f) else gpuPowerDrawHistory.toList(),
+                                color = MaterialTheme.colorScheme.tertiary,
+                                min = 0f,
+                                max = chartUpperBound(gpuPowerDrawHistory),
+                                showStats = true,
+                                valueFormatter = { value -> String.format(Locale.US, "%.2fW", value) },
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
+
                         gpuData.forEachIndexed { index, gpu ->
                             Text("GPU ${index + 1}", fontWeight = FontWeight.Bold)
                             FieldLine("Name", gpu.name)
                             GpuFieldLine("Clock", gpu.clock)
                             GpuFieldLine("VRAM", gpu.vram)
+                            GpuFieldLine("VRAM Usage", gpu.vramUsage)
                             GpuFieldLine("Speed", gpu.speed)
                             GpuFieldLine("Usage", gpu.usage)
+                            GpuFieldLine("Power Draw", gpu.powerDraw)
                             Spacer(modifier = Modifier.height(8.dp))
                         }
                     }
@@ -761,6 +852,7 @@ private fun MachineDetailScreen(
                             min = 0f,
                             max = maxThroughput(networkDownHistory, networkUpHistory),
                             showStats = true,
+                            valueFormatter = { value -> formatThroughputMbps(value) },
                         )
                         Spacer(modifier = Modifier.height(10.dp))
                         Text("Upload trend", style = MaterialTheme.typography.labelLarge)
@@ -770,6 +862,7 @@ private fun MachineDetailScreen(
                             min = 0f,
                             max = maxThroughput(networkDownHistory, networkUpHistory),
                             showStats = true,
+                            valueFormatter = { value -> formatThroughputMbps(value) },
                         )
                         Spacer(modifier = Modifier.height(10.dp))
                         if (networkData.isEmpty()) {
@@ -1142,9 +1235,11 @@ private fun unavailableGpuUi(reason: String): GpuMetric = GpuMetric(
     name = unavailable(reason),
     clock = unavailable(reason),
     vram = unavailable(reason),
+    vramUsage = unavailable(reason),
     generation = unavailable(reason),
     speed = unavailable(reason),
     usage = unavailable(reason),
+    powerDraw = unavailable(reason),
 )
 
 private fun hideMaxBandwidthForInterface(interfaceName: String): Boolean {
@@ -1181,7 +1276,27 @@ private fun parseThroughputMbps(text: String?): Float? {
     }
 }
 
+private fun formatThroughputMbps(value: Float): String =
+    when {
+        value >= 1_000f -> String.format(Locale.US, "%.2f Gbps", value / 1_000f)
+        value >= 1f -> String.format(Locale.US, "%.2f Mbps", value)
+        value >= 0.001f -> String.format(Locale.US, "%.2f Kbps", value * 1_000f)
+        else -> String.format(Locale.US, "%.0f bps", value * 1_000_000f)
+    }
+
+private fun sumThroughputMbps(values: List<String?>?): Float? {
+    if (values.isNullOrEmpty()) return null
+    val sum = values.mapNotNull { parseThroughputMbps(it) }.sum()
+    return if (sum > 0f) sum else null
+}
+
 private fun parseNumericValue(text: String?): Float? {
+    if (text.isNullOrBlank()) return null
+    val candidate = text.substringBefore(' ').replace("[^0-9.]".toRegex(), "")
+    return candidate.toFloatOrNull()
+}
+
+private fun parseGbValue(text: String?): Float? {
     if (text.isNullOrBlank()) return null
     val candidate = text.substringBefore(' ').replace("[^0-9.]".toRegex(), "")
     return candidate.toFloatOrNull()
@@ -1199,6 +1314,12 @@ private fun maxThroughput(down: List<Float>, up: List<Float>): Float {
     return if (peak < 10f) 10f else peak * 1.1f
 }
 
+private fun chartUpperBound(values: List<Float>): Float {
+    val peak = values.maxOrNull() ?: 1f
+    val padded = peak * 1.1f
+    return if (padded < 1f) 1f else padded
+}
+
 @Composable
 private fun RingMetricCard(
     title: String,
@@ -1212,17 +1333,21 @@ private fun RingMetricCard(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
     ) {
         Column(
-            modifier = Modifier.padding(12.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(title, style = MaterialTheme.typography.labelLarge)
             Spacer(modifier = Modifier.height(8.dp))
-            DonutUsageChart(
-                usedPercent = percent,
-                usedColor = color,
-                trackColor = MaterialTheme.colorScheme.surfaceVariant,
-                size = 72.dp,
-            )
+            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                DonutUsageChart(
+                    usedPercent = percent,
+                    usedColor = color,
+                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    size = 72.dp,
+                )
+            }
             Spacer(modifier = Modifier.height(8.dp))
             Text(value, style = MaterialTheme.typography.bodyMedium)
         }
